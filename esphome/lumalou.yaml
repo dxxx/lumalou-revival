@@ -1,0 +1,238 @@
+# Lumalou bridge: an ESP32 that keeps a Fisher-Price Lumalou (Mattel GWM53) working after its app was discontinued.
+# It holds the Bluetooth link to the lamp and serves a control page on your WiFi:  http://lumalou.local
+#
+# Before you flash, change the lines marked  <-- CHANGE :
+#   1. the board (any ESP32 with Bluetooth LE works; tested on an ESP32-S3-DevKitC-1),
+#   2. your lamp's Bluetooth address (find it with:  python ../python/lumalou_cli.py scan),
+#   3. your timezone,
+# and copy secrets.example.yaml to secrets.yaml with your WiFi + keys.
+# First flash over USB:  esphome run lumalou.yaml      Later updates go over WiFi.
+
+esphome:
+  name: lumalou
+  friendly_name: Lumalou
+
+esp32:
+  board: esp32-s3-devkitc-1      # <-- CHANGE to your board
+  flash_size: 16MB                # <-- CHANGE (4MB on most ESP32 DevKits)
+  framework:
+    type: esp-idf
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [lumalou]
+
+logger:
+  hardware_uart: UART0   # ESP32-S3 DevKitC: log on the "UART" USB port; remove this line on other boards
+
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret lumalou_api_key
+
+ota:
+  - platform: esphome
+    password: !secret lumalou_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Tip: a WiFi range extender may hide the board from "lumalou.local" and give it a new IP (extenders often translate MACs
+  # and drop mDNS). If that happens, pin the board to your router's own access point:
+  #   networks: [{ssid: !secret wifi_ssid, password: !secret wifi_password, bssid: <your router AP MAC>}]
+  ap:
+    ssid: "Lumalou Fallback"
+    password: !secret lumalou_ap_password
+
+captive_portal:
+
+# Phone page: lumalou-ui/lumalou.js is compressed into the firmware (no internet needed).
+# ESPHome's own UI stays one tap away (#advanced, needs internet).
+web_server:
+  port: 80
+  version: 3
+  js_url: ""
+  js_include: lumalou-ui/lumalou.js
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: AA:BB:CC:DD:EE:FF   # <-- CHANGE: your lamp (it advertises a 10-digit number as its name)
+    id: lamp_ble
+
+lumalou:
+  id: lamp
+  ble_client_id: lamp_ble
+
+select:
+  - platform: template
+    name: "Light colour"
+    id: light_colour
+    options: ["Warm spectrum", "Red", "Yellow", "Orange", "Green", "Blue", "Purple", "Night light", "Cool spectrum", "Rainbow", "Off"]
+    lambda: |-
+      int c = id(lamp).color();
+      if (c < 0 || c > 10) return {};
+      return id(light_colour).at(c).value();
+    update_interval: 2s
+    set_action:
+      - lambda: |-
+          auto i = id(light_colour).index_of(x);
+          if (i.has_value()) id(lamp).set_color(*i);
+  - platform: template
+    name: "Sound"
+    id: sound
+    # LumaAudioCommand (docs/COMMANDS.md §6)
+    options: ["Sleep playlist", "Custom playlist", "Pink noise", "Ocean", "Rain", "Brown noise", "Nature", "Highway"]
+    optimistic: true
+    set_action:
+      - lambda: |-
+          auto i = id(sound).index_of(x);
+          if (i.has_value()) id(lamp).play(*i);
+
+number:
+  - platform: template
+    name: "Brightness"
+    min_value: 0
+    max_value: 9
+    step: 1
+    lambda: |-
+      int b = id(lamp).brightness();
+      if (b < 0) return {};
+      return (float) b;
+    update_interval: 2s
+    set_action:
+      - lambda: id(lamp).set_brightness((int) x);
+  - platform: template
+    name: "Volume"
+    min_value: 0
+    max_value: 9
+    step: 1
+    lambda: |-
+      int v = id(lamp).volume();
+      if (v < 0) return {};
+      return (float) v;
+    update_interval: 2s
+    set_action:
+      - lambda: id(lamp).set_volume((int) x);
+  - platform: template
+    name: "Sunrise minutes"
+    id: sunrise_minutes
+    min_value: 5
+    max_value: 60
+    step: 5
+    initial_value: 20
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: min
+    icon: mdi:timer-sand
+
+button:
+  - platform: template
+    name: "Light off"
+    on_press:
+      - lambda: id(lamp).light_off();
+  - platform: template
+    name: "Sound off"
+    on_press:
+      - lambda: id(lamp).audio_off();
+  - platform: template
+    name: "Refresh"
+    on_press:
+      - lambda: id(lamp).fetch_all();
+  - platform: template
+    name: "Sync lamp clock"
+    on_press:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (t.is_valid()) id(lamp).set_date(t.hour, t.minute, t.second, t.day_of_week - 1);
+  - platform: template
+    name: "Test sunrise"
+    icon: mdi:weather-sunset-up
+    on_press:
+      - lambda: id(lamp).test_sunrise();
+  - platform: restart
+    name: "Restart bridge"
+
+binary_sensor:
+  - platform: template
+    name: "Lamp connected"
+    device_class: connectivity
+    lambda: return id(lamp).ready();
+
+# Internet time: pushed to the lamp's clock on every connect and every night at 03:00 (the lamp keeps only
+# hour/minute/second/weekday).
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/London   # <-- CHANGE to yours (tz database name)
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 3
+        then:
+          - lambda: |-
+              auto t = id(sntp_time).now();
+              if (t.is_valid()) id(lamp).set_date(t.hour, t.minute, t.second, t.day_of_week - 1);
+
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (id(lamp).needs_date() && t.is_valid())
+            id(lamp).set_date(t.hour, t.minute, t.second, t.day_of_week - 1);  // ESPHome: 1 = Sunday
+          // Sunrise wake light (runs here, on the board; no phone needed)
+          if (t.is_valid())
+            id(lamp).sunrise_tick(id(sunrise_on).state, (int) id(sunrise_minutes).state,
+                                  t.hour * 60 + t.minute, t.second, t.day_of_week - 1);
+
+# Sunrise wake light: before each wake-up time of the sleep trainer the light fades red -> orange -> yellow,
+# brightness 1 -> 9. Settings survive restarts.
+switch:
+  - platform: template
+    name: "Sunrise wake light"
+    id: sunrise_on
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    icon: mdi:weather-sunset-up
+
+# The page's command channel: hex "opcode args…" (e.g. "48 19 30 …"); the bridge encrypts and sends it.
+text:
+  - platform: template
+    name: "Lamp command"
+    id: lamp_command
+    mode: text
+    max_length: 120
+    optimistic: false
+    set_action:
+      - lambda: id(lamp).send_hex(x);
+
+text_sensor:
+  - platform: template
+    name: "Lamp data"   # everything known about the lamp, as JSON (the page reads this)
+    update_interval: 1s
+    lambda: |-
+      static uint32_t seen = UINT32_MAX;
+      if (id(lamp).changes() == seen) return {};
+      seen = id(lamp).changes();
+      return id(lamp).json();
+  - platform: template
+    name: "Lamp state (raw)"
+    lambda: return id(lamp).global_state();
+    update_interval: 5s
+  - platform: template
+    name: "Lamp firmware"
+    lambda: return id(lamp).firmware();
+    update_interval: 30s
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi signal"
+    update_interval: 60s
+  - platform: ble_client
+    type: rssi
+    ble_client_id: lamp_ble
+    name: "Lamp Bluetooth signal"
+    update_interval: 30s

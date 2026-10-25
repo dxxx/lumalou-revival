@@ -1,0 +1,16 @@
+# secrets and build output
+esphome/secrets.yaml
+esphome/.esphome/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# never commit vendor binaries or decompiler output
+*.apk
+*.apkm
+*.xapk
+*.so
+*.dex
+jadx/
+ghidra-proj/
